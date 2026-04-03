@@ -1,0 +1,14 @@
+# Secrets and deployment links
+whatsapp-backend/.env
+.vercel/
+whatsapp-backend/.vercel/
+
+# Local backups and exported data
+backups/
+
+# Dependencies
+whatsapp-backend/node_modules/
+
+# OS files
+Thumbs.db
+.DS_Store
