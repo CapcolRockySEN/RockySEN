@@ -1,3 +1,3 @@
-export const SUPABASE_URL = 'https://TU-PROYECTO.supabase.co';
-export const SUPABASE_ANON_KEY = 'TU_SUPABASE_ANON_KEY';
+export const SUPABASE_URL = 'https://mimwzefziqhrazihjvpa.supabase.co';
+export const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1pbXd6ZWZ6aXFocmF6aWhqdnBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyMjQwMzgsImV4cCI6MjA5MDgwMDAzOH0.adBH0XhUkfbbnFfhI4p3xodK8icp9OMyzmXXXSOloNQ';
 export const SUPABASE_PROFILES_TABLE = 'profiles';

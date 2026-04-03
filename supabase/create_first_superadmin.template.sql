@@ -7,8 +7,8 @@ insert into public.profiles (
   estado,
   supervisor_eligible
 ) values (
-  'eecb593e-25ce-4426-a8bb-c4128e73c894',
-  'rocky.med@capcol.com.co',
+  'dcc30ddc-866a-4847-b5e2-df69e6bf0a55',
+  'rocky.sen@capcol.com.co',
   'Administrador Principal',
   '1234567890',
   'superadmin',

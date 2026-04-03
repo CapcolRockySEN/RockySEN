@@ -58,5 +58,6 @@ Plataforma de gestion operativa y administrativa para el seguimiento de servicio
 
 ## Documentacion operativa
 - Supabase: `SUPABASE_SETUP.md`
+- Vercel: `VERCEL_SETUP.md`
 - WhatsApp backend: `WHATSAPP_BACKEND_MIGRATION.md`
 - Reconexion completa: `RECONNECTION_CHECKLIST.md`
