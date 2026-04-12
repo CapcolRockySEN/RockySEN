@@ -16,7 +16,7 @@ git push -u origin main
 ## 2. Supabase
 - Crear un proyecto nuevo en Supabase.
 - Ejecutar los esquemas SQL en el orden documentado en `SUPABASE_SETUP.md`.
-  Desde una base nueva, incluye `schema_foundation_phase0.sql` y todas las fases hasta `schema_operations_phase12.sql`.
+- Desde una base nueva, incluye `schema_foundation_phase0.sql` y todas las fases hasta `schema_operations_phase13.sql`.
 - Actualizar `src/assets/js/config.js` con:
 
 ```js
@@ -52,3 +52,4 @@ export const SUPABASE_ANON_KEY = 'TU_SUPABASE_ANON_KEY';
 - Probar lectura/escritura en Supabase.
 - Probar verificacion `GET /webhooks/whatsapp`.
 - Probar envio y recepcion de un mensaje real en WhatsApp.
+- Confirmar que `attendance`, `import_replacements` y `daily_metrics` quedaron agregadas a `supabase_realtime`.
