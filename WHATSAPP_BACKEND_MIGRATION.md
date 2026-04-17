@@ -3,7 +3,7 @@
 ## Estado
 - El webhook ya opera fuera de Firebase.
 - El backend activo está en `whatsapp-backend/`.
-- El despliegue objetivo es Vercel, pero debe quedar enlazado a una cuenta y proyecto nuevos.
+- El despliegue objetivo es Vercel.
 
 ## Backend actual
 Archivos principales:
@@ -17,6 +17,8 @@ Definir en Vercel para el proyecto backend:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `CRON_SECRET`
+- `EMPLOYEE_PORTAL_ALLOWED_ORIGINS`
+- `EMPLOYEE_PORTAL_SESSION_HOURS`
 - `WHATSAPP_VERIFY_TOKEN`
 - `WHATSAPP_ACCESS_TOKEN`
 - `WHATSAPP_PHONE_NUMBER_ID`
@@ -24,7 +26,6 @@ Definir en Vercel para el proyecto backend:
 - `WHATSAPP_APP_SECRET`
 
 Tambien actualiza localmente `whatsapp-backend/.env` con esos mismos valores.
-La plantilla base ya quedo disponible en `whatsapp-backend/.env.example`.
 
 ## Base de datos requerida
 Ejecutar en una base nueva:
@@ -43,8 +44,8 @@ Ejecutar en una base nueva:
 - `supabase/schema_operations_phase10.sql:1`
 - `supabase/schema_operations_phase11.sql:1`
 - `supabase/schema_operations_phase12.sql:1`
-
-Si faltan las fases 9 a 12, el webhook puede recibir mensajes, pero fallaran cierres, consolidacion operativa, `audit_logs`, `employee_daily_status` y varias RPCs usadas por `whatsapp-backend/src/app.js`.
+- `supabase/schema_operations_phase13.sql:1`
+- `supabase/schema_operations_phase14_employee_portal.sql:1`
 
 ## Flujo ya operativo
 - verificacion del webhook de Meta
@@ -77,9 +78,3 @@ Si faltan las fases 9 a 12, el webhook puede recibir mensajes, pero fallaran cie
 - `audit_logs`
 - `supervisor_profile`
 - `incapacitados`
-
-## Pendiente
-- endurecer validacion final de firma con `WHATSAPP_APP_SECRET`
-- ampliar reglas finas de negocio
-- revisar rotacion de secretos expuestos historicamente
-- crear un webhook nuevo en Meta apuntando al nuevo dominio backend
