@@ -19,10 +19,10 @@ export const Contact = (mount) => {
       contactCard(
         'TU EMPRESA',
         [
-          ['Pagina web', 'www.tudominio.com', 'https://www.tudominio.com'],
-          ['Direccion', 'Direccion de tu empresa'],
-          ['Telefono', 'Telefono de tu empresa'],
-          ['Correo', 'tucorreo@tudominio.com', 'mailto:tucorreo@tudominio.com']
+          ['Pagina web', 'www.serviciosintegralessi.com/', 'https://serviciosintegralessi.com/'],
+          ['Direccion', 'Calle 34A # 77-10 - Medellín'],
+          ['Telefono', '313 697 2266 - 311 711 4900'],
+          ['Correo', 'serinteglaresltda@hotmail.com', 'mailto:serinteglaresltda@hotmail.com']
         ]
       )
     ])
