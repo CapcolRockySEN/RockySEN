@@ -59,7 +59,7 @@ const MENU_IDS = {
 };
 
 const NO_REGISTERED_MESSAGE = 'No estás registrado en nuestra base de datos, por favor comunícate con tu supervisor.';
-const EMPLOYEE_PORTAL_URL = 'https://rockymed.capcol.com.co/employee.html';
+const EMPLOYEE_PORTAL_URL = 'https://rockysen.capcol.com.co/employee.html';
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
