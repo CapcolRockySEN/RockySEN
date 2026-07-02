@@ -11,6 +11,24 @@ as $$
   end;
 $$;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'employee_cargo_history_valid_date_range'
+      and conrelid = 'public.employee_cargo_history'::regclass
+  ) then
+    alter table public.employee_cargo_history
+      add constraint employee_cargo_history_valid_date_range
+      check (
+        fecha_ingreso is null
+        or fecha_retiro is null
+        or fecha_ingreso::date <= fecha_retiro::date
+      ) not valid;
+  end if;
+end $$;
+
 create or replace function public.bool_from_text_truthy(value text)
 returns boolean
 language sql

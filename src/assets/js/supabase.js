@@ -1122,6 +1122,7 @@ async function appendEmployeeCargoHistory({
   source = 'manual'
 }) {
   if (!employeeId) return;
+  assertEmployeeHistoryDateRange(fechaIngreso, fechaRetiro);
   const { error } = await supabase.from('employee_cargo_history').insert({
     employee_id: employeeId,
     employee_codigo: employeeCodigo || null,
@@ -1141,6 +1142,7 @@ async function appendEmployeeCargoHistory({
 async function appendEmployeeCargoHistoryBulk(rows = [], notifyReload = true) {
   const items = Array.isArray(rows) ? rows.filter((row) => row?.employee_id) : [];
   if (!items.length) return;
+  items.forEach((row) => assertEmployeeHistoryDateRange(row.fecha_ingreso, row.fecha_retiro));
   const { error } = await supabase.from('employee_cargo_history').insert(items);
   if (error) throw error;
   if (notifyReload) {
@@ -1151,6 +1153,7 @@ async function appendEmployeeCargoHistoryBulk(rows = [], notifyReload = true) {
 async function closeActiveEmployeeHistory(employeeId, fechaRetiro, notifyReload = true) {
   const empId = String(employeeId || '').trim();
   if (!empId || !fechaRetiro) return;
+  await assertCanCloseActiveEmployeeHistory(empId, fechaRetiro);
   const { error } = await supabase
     .from('employee_cargo_history')
     .update({ fecha_retiro: fechaRetiro })
@@ -1166,6 +1169,7 @@ async function patchActiveEmployeeHistory(employeeId, patch = {}, notifyReload =
   const empId = String(employeeId || '').trim();
   const updates = Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined));
   if (!empId || !Object.keys(updates).length) return;
+  await assertActiveEmployeeHistoryPatchRanges(empId, updates);
   const { error } = await supabase
     .from('employee_cargo_history')
     .update(updates)
@@ -1175,6 +1179,50 @@ async function patchActiveEmployeeHistory(employeeId, patch = {}, notifyReload =
   if (notifyReload) {
     await notifyTableReload('employee_cargo_history');
   }
+}
+
+function assertEmployeeHistoryDateRange(fechaIngreso, fechaRetiro) {
+  const ingreso = toISODate(fechaIngreso);
+  const retiro = toISODate(fechaRetiro);
+  if (ingreso && retiro && ingreso > retiro) {
+    throw new Error('La fecha de ingreso del historial no puede ser posterior a la fecha de retiro.');
+  }
+}
+
+async function fetchOpenEmployeeHistoryRows(employeeId) {
+  const empId = String(employeeId || '').trim();
+  if (!empId) return [];
+  const { data, error } = await supabase
+    .from('employee_cargo_history')
+    .select('id, fecha_ingreso, fecha_retiro, sede_codigo, sede_nombre, cargo_codigo, cargo_nombre, created_at')
+    .eq('employee_id', empId)
+    .is('fecha_retiro', null)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+async function assertCanCloseActiveEmployeeHistory(employeeId, fechaRetiro) {
+  const retiro = toISODate(fechaRetiro);
+  if (!retiro) return;
+  const openRows = await fetchOpenEmployeeHistoryRows(employeeId);
+  const invalid = openRows.find((row) => {
+    const ingreso = toISODate(row?.fecha_ingreso);
+    return ingreso && ingreso > retiro;
+  });
+  if (invalid) {
+    throw new Error('No se puede cerrar una asignacion activa con una fecha anterior a su fecha de ingreso. Revisa si ya existe un traslado/cambio efectivo para esa fecha.');
+  }
+}
+
+async function assertActiveEmployeeHistoryPatchRanges(employeeId, patch = {}) {
+  if (!('fecha_ingreso' in patch) && !('fecha_retiro' in patch)) return;
+  const openRows = await fetchOpenEmployeeHistoryRows(employeeId);
+  openRows.forEach((row) => {
+    const ingreso = 'fecha_ingreso' in patch ? patch.fecha_ingreso : row.fecha_ingreso;
+    const retiro = 'fecha_retiro' in patch ? patch.fecha_retiro : row.fecha_retiro;
+    assertEmployeeHistoryDateRange(ingreso, retiro);
+  });
 }
 
 async function upsertSupervisorProfileFromEmployee(employee, override = {}) {
@@ -2743,6 +2791,13 @@ export async function updateEmployee(id, data = {}) {
   }
   if (sedeChangedPreview && assignmentIngresoPreview && assignmentIngresoPreview < todayBogotaISO()) {
     throw new Error(`La fecha de inicio en nueva sede no puede ser anterior a hoy (${todayBogotaISO()}).`);
+  }
+  if (
+    String(currentRow.estado || 'activo').trim().toLowerCase() === 'activo'
+    && (sedeChangedPreview || cargoChangedPreview)
+    && assignmentRetiroPreview
+  ) {
+    await assertCanCloseActiveEmployeeHistory(id, data.assignmentFechaRetiro || data.historialFechaRetiro || data.fechaHistorialRetiro);
   }
   if (sedeChangedPreview && !cargoChangedPreview && patch.fecha_ingreso !== undefined && nextIngresoPreview !== currentIngreso) {
     patch.fecha_ingreso = currentRow.fecha_ingreso || null;
