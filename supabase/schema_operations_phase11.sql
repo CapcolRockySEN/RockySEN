@@ -216,6 +216,19 @@ begin
     raise exception 'Fecha invalida para employee_daily_status: %', p_fecha;
   end if;
 
+  if exists (
+    select 1
+    from public.daily_closures dc
+    where dc.fecha = p_fecha
+      and (dc.locked = true or lower(trim(coalesce(dc.status, ''))) = 'closed')
+  ) then
+    select count(*)::integer
+    into v_rows
+    from public.employee_daily_status
+    where fecha = p_fecha;
+    return v_rows;
+  end if;
+
   delete from public.employee_daily_status where fecha = p_fecha;
 
   with active_sedes as (
