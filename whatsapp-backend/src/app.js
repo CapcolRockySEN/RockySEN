@@ -2,7 +2,7 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import QRCode from 'qrcode';
-import { config } from './config.js';
+import { config, isAllowedCorsOrigin } from './config.js';
 import { buildEmployeeCertificatePdf, certificateFileName, normalizeCertificateType } from './certificates/certificate-service.js';
 import { getActiveEmployeePortalContext, registerEmployeePortalRoutes } from './employee-portal.js';
 import { supabaseAdmin } from './supabase.js';
@@ -355,7 +355,12 @@ function extractMessages(body = {}) {
     (Array.isArray(entry?.changes) ? entry.changes : []).flatMap((change) => {
       const value = change?.value || {};
       const metadata = value?.metadata || {};
-      return (Array.isArray(value?.messages) ? value.messages : []).map((message) => ({ ...message, metadata }));
+      const senderContacts = Array.isArray(value?.contacts) ? value.contacts : [];
+      return (Array.isArray(value?.messages) ? value.messages : []).map((message) => ({
+        ...message,
+        metadata,
+        sender_contact: senderContacts[0] || null
+      }));
     })
   );
 }
@@ -428,7 +433,7 @@ function getQrDeviceTokenFromRequest(req) {
 function attendanceQrCors(req, res) {
   const origin = String(req.headers.origin || '').trim();
   if (!origin) return;
-  if (config.employeePortalAllowedOrigins.length && !config.employeePortalAllowedOrigins.includes(origin)) return;
+  if (!isAllowedCorsOrigin(origin)) return;
 
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
@@ -532,7 +537,7 @@ function registerCertificateRoutes(appInstance) {
 function certificateCors(req, res) {
   const origin = String(req.headers.origin || '').trim();
   if (!origin) return;
-  if (config.employeePortalAllowedOrigins.length && !config.employeePortalAllowedOrigins.includes(origin)) return;
+  if (!isAllowedCorsOrigin(origin)) return;
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -1356,7 +1361,7 @@ async function storeIncomingEvent({ eventType, payload }) {
     source: 'whatsapp_cloud_api',
     event_type: eventType,
     message_id: payload?.id || payload?.message_id || null,
-    wa_from: payload?.from || payload?.recipient_id || null,
+    wa_from: getWhatsAppRecipient(payload) || null,
     wa_timestamp: payload?.timestamp || null,
     wa_type: payload?.type || payload?.status || null,
     text_body: extractMessageText(payload),
@@ -1384,7 +1389,7 @@ async function markIncomingProcessed(id, status, reason) {
 
 async function notifyProcessingError(message, error) {
   if (error?.userNotified === true) return;
-  const phone = normalizePhone(message?.from);
+  const phone = getWhatsAppRecipient(message);
   if (!phone) return;
   try {
     await sendText(phone, userMessageForProcessingError(error));
@@ -1414,11 +1419,16 @@ function userMessageForProcessingError(error) {
 }
 
 async function processIncomingMessage(message) {
-  const phone = normalizePhone(message?.from);
-  if (!phone) throw new Error('missing_phone_number');
+  const phone = getWhatsAppRecipient(message);
+  if (!phone) throw new Error('missing_whatsapp_recipient');
 
   const session = await getSession(phone);
   const parsed = parseInboundAction(message);
+
+  if (parsed.contactPhone) {
+    await handleSharedContact(phone, session, parsed);
+    return;
+  }
 
   if (!parsed.value && !parsed.id && !parsed.location) {
     await sendText(phone, 'No entendí tu respuesta. Por favor selecciona una opción del menú.');
@@ -1482,15 +1492,25 @@ async function processIncomingMessage(message) {
   }
 }
 async function startIdentificationFlow(phone) {
-  const employeeByPhone = await findEmployeeByPhone(phone);
+  const employeeByPhone = await findEmployeeByPhone(getSessionPhone({ id: phone, phone_number: phone }));
   if (employeeByPhone) {
     await storeSession(phone, {
+      phone_number: employeeByPhone.telefono || normalizePhone(phone) || null,
       employee_id: employeeByPhone.id,
       documento: employeeByPhone.documento,
       session_state: SESSION.AWAITING_ACTION,
       session_data: { employee: sessionEmployee(employeeByPhone), identifiedBy: 'phone' }
     });
     await sendIdentityOrMenu(phone, employeeByPhone);
+    return;
+  }
+
+  if (!normalizePhone(phone)) {
+    await storeSession(phone, {
+      session_state: SESSION.AWAITING_DOCUMENT,
+      session_data: { identifiedBy: 'hidden_phone', awaitingContact: true }
+    });
+    await sendContactRequest(phone);
     return;
   }
 
@@ -1501,7 +1521,49 @@ async function startIdentificationFlow(phone) {
   await sendText(phone, 'Hola, no encontramos tu número registrado en la base de datos, por favor escribe tu cédula sin puntos.');
 }
 
+async function handleSharedContact(phone, session, parsed) {
+  const sharedPhone = normalizePhone(parsed.contactPhone);
+  if (!sharedPhone) {
+    await sendContactRequest(phone);
+    return;
+  }
+
+  const employee = await findEmployeeByPhone(sharedPhone);
+  if (employee) {
+    await storeSession(phone, {
+      phone_number: sharedPhone,
+      employee_id: employee.id,
+      documento: employee.documento,
+      session_state: SESSION.AWAITING_ACTION,
+      session_data: {
+        ...(session.session_data || {}),
+        employee: sessionEmployee(employee),
+        identifiedBy: parsed.contactOrigin === 'contact_request' ? 'shared_contact_request' : 'shared_contact',
+        sharedPhone
+      }
+    });
+    await sendIdentityOrMenu(phone, employee);
+    return;
+  }
+
+  await storeSession(phone, {
+    phone_number: sharedPhone,
+    session_state: SESSION.AWAITING_DOCUMENT,
+    session_data: {
+      ...(session.session_data || {}),
+      identifiedBy: parsed.contactOrigin === 'contact_request' ? 'shared_contact_request_unknown' : 'shared_contact_unknown',
+      sharedPhone
+    }
+  });
+  await sendText(phone, 'No encontramos ese número registrado en la base de datos, por favor escribe tu cédula sin puntos.');
+}
+
 async function handleDocumentInput(phone, session, value) {
+  if (session?.session_data?.awaitingContact && !getSessionPhone(session) && !normalizePhone(phone)) {
+    await sendContactRequest(phone);
+    return;
+  }
+
   const document = normalizeDocument(value);
   if (!document) {
     await sendText(phone, 'Por favor escribe tu número de cédula sin puntos.');
@@ -1516,6 +1578,7 @@ async function handleDocumentInput(phone, session, value) {
   }
 
   await storeSession(phone, {
+    phone_number: getSessionPhone(session) || normalizePhone(phone) || null,
     employee_id: employee.id,
     documento: employee.documento,
     session_state: SESSION.AWAITING_ACTION,
@@ -1706,6 +1769,7 @@ async function handlePhoneUpdate(phone, session, value) {
 
   const refreshed = { ...employee, telefono: normalizedPhone };
   await storeSession(phone, {
+    phone_number: normalizedPhone,
     employee_id: employee.id,
     documento: employee.documento,
     session_state: SESSION.COMPLETED,
@@ -1779,8 +1843,27 @@ async function handleTransferSelection(phone, session, parsed) {
   if (error) throw error;
 
   try {
-    await syncEmployeeSedeHistoryAfterTransfer(employee, selected, transferDate);
+    const historySync = await syncEmployeeSedeHistoryAfterTransfer(employee, selected, transferDate);
     await refreshOperationalState(transferDate);
+    await insertSystemAuditLog({
+      actorEmail: 'whatsapp@system',
+      targetType: 'employee',
+      targetId: employee.id,
+      action: 'transfer_employee_whatsapp',
+      before: {
+        ...previousEmployeeSedeSnapshot,
+        history: historySync.before
+      },
+      after: {
+        sede_codigo: selected.codigo || null,
+        sede_nombre: selected.nombre || null,
+        zona_codigo: selected.zona_codigo || null,
+        zona_nombre: selected.zona_nombre || null,
+        transfer_date: transferDate,
+        history: historySync.after
+      },
+      note: `Cambio de sede solicitado desde WhatsApp (${phone}).`
+    });
   } catch (historyError) {
     await supabaseAdmin.from('employees').update({
       ...previousEmployeeSedeSnapshot,
@@ -1802,27 +1885,68 @@ async function handleTransferSelection(phone, session, parsed) {
 async function syncEmployeeSedeHistoryAfterTransfer(employee, selectedSede, transferDate) {
   const employeeId = String(employee?.id || '').trim();
   const selectedCode = String(selectedSede?.codigo || '').trim();
-  if (!employeeId || !selectedCode || !transferDate) return;
+  if (!employeeId || !selectedCode || !transferDate) return { before: [], after: [] };
 
   const selectedName = selectedSede?.nombre || null;
   const previousDay = addDaysToIsoDate(transferDate, -1) || transferDate;
+  const transferIngreso = `${transferDate}T05:00:00+00:00`;
 
   const { data: openRows, error: openRowsError } = await supabaseAdmin
     .from('employee_cargo_history')
-    .select('id, employee_id, sede_codigo, fecha_ingreso, fecha_retiro, created_at')
+    .select('*')
     .eq('employee_id', employeeId)
     .is('fecha_retiro', null)
     .order('created_at', { ascending: false });
   if (openRowsError) throw openRowsError;
 
   const normalizedOpenRows = openRows || [];
+  const beforeRows = normalizedOpenRows.map((row) => ({ ...row }));
   const openOnSelectedSede = normalizedOpenRows.find((row) => String(row?.sede_codigo || '').trim() === selectedCode) || null;
+  const openStartedToday = normalizedOpenRows
+    .filter((row) => isoDatePart(row?.fecha_ingreso) === transferDate)
+    .sort((left, right) => String(right?.created_at || '').localeCompare(String(left?.created_at || '')))[0] || null;
+  let selectedOpenRow = openOnSelectedSede || null;
+
+  if (!selectedOpenRow && openStartedToday?.id) {
+    const { data: patchedTodayRow, error: patchTodayError } = await supabaseAdmin
+      .from('employee_cargo_history')
+      .update({
+        employee_codigo: employee?.codigo || null,
+        documento: employee?.documento || null,
+        cargo_codigo: employee?.cargo_codigo || null,
+        cargo_nombre: employee?.cargo_nombre || null,
+        sede_codigo: selectedCode,
+        sede_nombre: selectedName,
+        source: 'sede_change'
+      })
+      .eq('id', openStartedToday.id)
+      .select('*')
+      .single();
+    if (patchTodayError) throw patchTodayError;
+    selectedOpenRow = patchedTodayRow || openStartedToday;
+  }
 
   for (const row of normalizedOpenRows) {
-    if (openOnSelectedSede && row.id === openOnSelectedSede.id) continue;
+    if (selectedOpenRow && row.id === selectedOpenRow.id) continue;
     const ingresoDate = isoDatePart(row?.fecha_ingreso);
+    if (ingresoDate && ingresoDate > transferDate) continue;
+    if (ingresoDate && ingresoDate === transferDate) {
+      const { error: deleteError } = await supabaseAdmin
+        .from('employee_cargo_history')
+        .delete()
+        .eq('id', row.id);
+      if (deleteError) throw deleteError;
+      continue;
+    }
     let retiroDate = previousDay;
-    if (ingresoDate && retiroDate < ingresoDate) retiroDate = ingresoDate;
+    if (ingresoDate && retiroDate < ingresoDate) {
+      const { error: deleteError } = await supabaseAdmin
+        .from('employee_cargo_history')
+        .delete()
+        .eq('id', row.id);
+      if (deleteError) throw deleteError;
+      continue;
+    }
     const patchedRetiro = withIsoDatePreservingTime(row?.fecha_retiro, retiroDate);
     const { error: closeError } = await supabaseAdmin
       .from('employee_cargo_history')
@@ -1831,22 +1955,34 @@ async function syncEmployeeSedeHistoryAfterTransfer(employee, selectedSede, tran
     if (closeError) throw closeError;
   }
 
-  if (openOnSelectedSede) return;
+  if (!selectedOpenRow) {
+    const { error: insertError } = await supabaseAdmin.from('employee_cargo_history').insert({
+      employee_id: employeeId,
+      employee_codigo: employee?.codigo || null,
+      documento: employee?.documento || null,
+      cargo_codigo: employee?.cargo_codigo || null,
+      cargo_nombre: employee?.cargo_nombre || null,
+      fecha_ingreso: transferIngreso,
+      fecha_retiro: null,
+      source: 'sede_change',
+      sede_codigo: selectedCode,
+      sede_nombre: selectedName
+    });
+    if (insertError) throw insertError;
+  }
 
-  const transferIngreso = `${transferDate}T05:00:00+00:00`;
-  const { error: insertError } = await supabaseAdmin.from('employee_cargo_history').insert({
-    employee_id: employeeId,
-    employee_codigo: employee?.codigo || null,
-    documento: employee?.documento || null,
-    cargo_codigo: employee?.cargo_codigo || null,
-    cargo_nombre: employee?.cargo_nombre || null,
-    fecha_ingreso: transferIngreso,
-    fecha_retiro: null,
-    source: 'sede_change',
-    sede_codigo: selectedCode,
-    sede_nombre: selectedName
-  });
-  if (insertError) throw insertError;
+  const { data: afterRows, error: afterRowsError } = await supabaseAdmin
+    .from('employee_cargo_history')
+    .select('*')
+    .eq('employee_id', employeeId)
+    .or(`fecha_retiro.is.null,fecha_retiro.gte.${previousDay}T00:00:00+00:00`)
+    .order('fecha_ingreso', { ascending: false });
+  if (afterRowsError) throw afterRowsError;
+
+  return {
+    before: beforeRows,
+    after: afterRows || []
+  };
 }
 
 async function handleWorkingSedeSelection(phone, session, parsed) {
@@ -2069,6 +2205,8 @@ function distanceBetweenMeters(latA, lngA, latB, lngB) {
 
 async function sendAttendanceQr(phone, employee, action, selectedSede = null, locationProof = null) {
   const freshEmployee = await reloadEmployeeForAttendance(employee);
+  const session = await getSession(phone);
+  const contactPhone = getSessionPhone(session) || normalizePhone(phone) || null;
   const documento = normalizeDocument(freshEmployee?.documento);
   const sedeCodigo = selectedSede?.codigo || freshEmployee?.sede_codigo || null;
   const sedeNombre = selectedSede?.nombre || freshEmployee?.sede_nombre || null;
@@ -2086,7 +2224,7 @@ async function sendAttendanceQr(phone, employee, action, selectedSede = null, lo
     nombre: freshEmployee.nombre || null,
     sede_codigo: sedeCodigo,
     sede_nombre: sedeNombre || null,
-    phone_number: phone,
+    phone_number: contactPhone,
     request_latitude: typeof locationProof?.latitude === 'number' ? locationProof.latitude : null,
     request_longitude: typeof locationProof?.longitude === 'number' ? locationProof.longitude : null,
     request_distance_meters: Number.isFinite(Number(locationProof?.distanceMeters)) ? Number(locationProof.distanceMeters) : null,
@@ -2228,7 +2366,11 @@ async function registerNovelty(phone, employee, novelty, selectedSede = null, in
   }, { onConflict: 'id' });
   if (attendanceError) throw attendanceError;
 
-  if (novelty.absenteeism) {
+  const scheduledForService = novelty.absenteeism
+    ? await isAttendanceScheduledForOperationalService({ date, employeeId: freshEmployee.id, documento })
+    : false;
+
+  if (novelty.absenteeism && scheduledForService) {
     const { error: absenteeismError } = await supabaseAdmin.from('absenteeism').upsert({
       id: attendanceId,
       fecha: date,
@@ -2276,6 +2418,35 @@ async function registerNovelty(phone, employee, novelty, selectedSede = null, in
   await sendText(phone, `Registro confirmado. Fecha: ${formatDateForHumans(date)}, Hora: ${time}, Novedad: ${novelty.label}, Muchas Gracias.`);
 }
 
+async function isAttendanceScheduledForOperationalService({ date, employeeId, documento }) {
+  const day = String(date || '').trim();
+  const empId = String(employeeId || '').trim();
+  const doc = String(documento || '').trim();
+  if (!day || (!empId && !doc)) return false;
+
+  const refreshed = await refreshEmployeeDailyStatusSnapshot(day);
+  if (refreshed === null) return true;
+
+  let query = supabaseAdmin
+    .from('employee_daily_status')
+    .select('servicio_programado')
+    .eq('fecha', day)
+    .eq('tipo_personal', 'empleado')
+    .limit(1);
+  if (empId && doc) {
+    query = query.or(`employee_id.eq.${empId},documento.eq.${doc}`);
+  } else if (empId) {
+    query = query.eq('employee_id', empId);
+  } else {
+    query = query.eq('documento', doc);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : null;
+  return row?.servicio_programado === true;
+}
+
 async function clearDailyOperationalAbsenceArtifacts(recordId) {
   const dailyId = String(recordId || '').trim();
   if (!dailyId) return;
@@ -2319,6 +2490,32 @@ async function fetchDailyMetricsRow(date) {
     .maybeSingle();
   if (error) throw error;
   return data || null;
+}
+
+async function normalizeZeroDemandDailyMetrics(date) {
+  const day = String(date || '').trim();
+  if (!day) return null;
+  const row = await fetchDailyMetricsRow(day);
+  if (!row) return null;
+  const planned = Number(row?.planned || 0);
+  const expected = Number(row?.expected || 0);
+  if (planned !== 0 || expected !== 0) return row;
+  const attendanceCount = Number(row?.attendance_count || 0);
+  if (Number(row?.absenteeism || 0) === 0 && Number(row?.missing || 0) === 0 && Number(row?.paid_services || 0) === attendanceCount) {
+    return row;
+  }
+  const { data, error } = await supabaseAdmin
+    .from('daily_metrics')
+    .update({
+      absenteeism: 0,
+      missing: 0,
+      paid_services: attendanceCount
+    })
+    .eq('fecha', day)
+    .select('*')
+    .maybeSingle();
+  if (error) throw error;
+  return data || row;
 }
 
 async function removeInvalidScheduledEmployeeDailyStatusRows(date) {
@@ -2417,6 +2614,7 @@ async function refreshOperationalSnapshotsFromEmployeeDailyStatus(date) {
     if (isMissingRpcError(error)) return null;
     throw error;
   }
+  await normalizeZeroDemandDailyMetrics(day);
 
   return unwrapRpcSingleRow(data);
 }
@@ -2446,7 +2644,8 @@ async function recomputeDailyMetrics(date) {
     if (error) {
       if (!isMissingRpcError(error)) throw error;
     } else {
-      return unwrapRpcSingleRow(data) || (await fetchDailyMetricsRow(day));
+      await normalizeZeroDemandDailyMetrics(day);
+      return (await fetchDailyMetricsRow(day)) || unwrapRpcSingleRow(data);
     }
   }
 
@@ -2500,12 +2699,11 @@ async function recomputeDailyMetrics(date) {
   const uniqueDocs = new Set(attRows.map((row) => String(row?.documento || row?.empleado_id || '').trim()).filter(Boolean));
   const dedupedAttendanceRows = dedupeAttendanceRows(attRows);
   const actualAttendanceCount = dedupedAttendanceRows.filter((row) => row?.asistio === true).length;
-  const actualAbsenteeism = dedupedAttendanceRows.filter((row) => row?.asistio === false).length;
   const attendanceCount = planned === 0 && expected === 0
     ? actualAttendanceCount
     : attRows.filter((row) => metricAttendanceCountsAsService(row, replacementMap, replacementRules)).length;
   const absenteeism = planned === 0 && expected === 0
-    ? actualAbsenteeism
+    ? 0
     : attRows.filter((row) => metricAttendanceCountsAsAbsenteeism(row, replacementMap, replacementRules)).length;
   const paidServices = attendanceCount;
   const noContracted = Math.max(0, planned - expected);
@@ -2608,8 +2806,10 @@ async function recomputeSedeStatusSnapshot(date) {
     const source = assignment || employee;
     const sedeCode = String(row?.sede_codigo || source?.sede_codigo || source?.sedeCodigo || '').trim();
     if (!sedeCode || !activeSedeCodes.has(sedeCode)) return;
-    if (!registeredBySede.has(sedeCode)) registeredBySede.set(sedeCode, new Set());
-    registeredBySede.get(sedeCode).add(doc || empId || String(row?.id || '').trim());
+    if (row?.asistio === true) {
+      if (!registeredBySede.has(sedeCode)) registeredBySede.set(sedeCode, new Set());
+      registeredBySede.get(sedeCode).add(doc || empId || String(row?.id || '').trim());
+    }
     const repl = replacementMap.get(metricReplacementKey(row)) || null;
     const hasReplacement = String(repl?.decision || '').trim().toLowerCase() === 'reemplazo';
     if (row?.asistio === false && metricAttendanceRequiresReplacement(row, replacementRules) && !hasReplacement) {
@@ -2983,7 +3183,7 @@ async function computeDailyClosureSummary(date) {
     summary.asistencias = actualRows.filter((row) => row?.asistio === true).length;
     summary.ausentismos = 0;
     summary.faltan = 0;
-    summary.sobran = actualRows.length;
+    summary.sobran = summary.asistencias;
   }
 
   summary.noContratados = Math.max(0, summary.planeados - summary.contratados);
@@ -3063,6 +3263,7 @@ async function computeDailySedeClosureSnapshot(date) {
 
   const registeredBySede = new Map();
   for (const row of dedupeAttendanceRows(attendance || [])) {
+    if (row?.asistio !== true) continue;
     const doc = String(row?.documento || '').trim();
     if (doc && replacementSuperDocs.has(day + '|' + doc)) continue;
     if (doc && supernumerarioDocs.has(doc)) continue;
@@ -3085,7 +3286,7 @@ async function computeDailySedeClosureSnapshot(date) {
     const registrados = Number(registeredBySede.get(sedeCode)?.size || 0);
     const externalRegistered = Math.max(0, registrados - baseContracted);
     const contratados = Math.min(planeados, baseContracted + externalRegistered);
-    const faltantes = Math.max(0, planeados - registrados);
+    const faltantes = Math.max(0, planeados - contratados);
     const sobrantes = Math.max(0, registrados - planeados);
     return {
       id: day + '_' + sedeCode,
@@ -3113,7 +3314,7 @@ async function persistDailySedeClosureSnapshot(day) {
   return snapshot;
 }
 
-async function closeOperationDay(date) {
+export async function closeOperationDay(date) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || '').trim())) {
     throw new Error('invalid_date');
   }
@@ -3198,13 +3399,13 @@ async function closeOperationDay(date) {
         fecha: day,
         status: 'closed',
         locked: true,
-        planeados: Number(closureSummary?.planeados || metrics?.planned || 0),
-        contratados: Number(closureSummary?.contratados || metrics?.expected || 0),
-        asistencias: Number(closureSummary?.asistencias || 0),
-        ausentismos: Number(closureSummary?.ausentismos || metrics?.absenteeism || 0),
-        faltan: Number(closureSummary?.faltan || 0),
-        sobran: Number(closureSummary?.sobran || 0),
-        no_contratados: Number(closureSummary?.noContratados || metrics?.no_contracted || metrics?.noContracted || 0),
+        planeados: Number(closureSummary?.planeados ?? metrics?.planned ?? 0),
+        contratados: Number(closureSummary?.contratados ?? metrics?.expected ?? 0),
+        asistencias: Number(closureSummary?.asistencias ?? 0),
+        ausentismos: Number(closureSummary?.ausentismos ?? metrics?.absenteeism ?? 0),
+        faltan: Number(closureSummary?.faltan ?? 0),
+        sobran: Number(closureSummary?.sobran ?? 0),
+        no_contratados: Number(closureSummary?.noContratados ?? metrics?.no_contracted ?? metrics?.noContracted ?? 0),
         closed_by_uid: null,
         closed_by_email: 'cron@system'
       }, { onConflict: 'id' });
@@ -3336,23 +3537,29 @@ function assertCronAuthorized(req) {
 }
 
 async function finalizePendingAbsenteeismForClosure(day) {
+  await refreshEmployeeDailyStatusSnapshot(day);
   const [
     { data: attendanceRows, error: attendanceError },
     { data: replacementRows, error: replacementsError },
+    { data: statusRows, error: statusError },
     novedadesRows
   ] = await Promise.all([
     supabaseAdmin.from('attendance').select('*').eq('fecha', day),
     supabaseAdmin.from('import_replacements').select('*').eq('fecha', day),
+    supabaseAdmin.from('employee_daily_status').select('fecha, employee_id, documento, tipo_personal, servicio_programado').eq('fecha', day),
     selectAllRows('novedades', 'codigo, codigo_novedad, nombre, reemplazo')
   ]);
   if (attendanceError) throw attendanceError;
   if (replacementsError) throw replacementsError;
+  if (statusError) throw statusError;
 
   const replacementRules = buildNovedadReplacementRules(novedadesRows || []);
   const replacementMap = new Map((replacementRows || []).map((row) => [metricReplacementKey(row), row]));
+  const scheduledServiceLookup = buildScheduledServiceLookup(statusRows || []);
 
   for (const row of attendanceRows || []) {
     if (!metricAttendanceRequiresReplacement(row, replacementRules)) continue;
+    if (!attendanceHasScheduledService(row, scheduledServiceLookup)) continue;
     const key = metricReplacementKey(row);
     const existing = replacementMap.get(key);
     const existingDecision = String(existing?.decision || '').trim().toLowerCase();
@@ -3396,19 +3603,43 @@ async function finalizePendingAbsenteeismForClosure(day) {
   await materializeClosedOperationalAbsenteeismForClosure(day);
 }
 
+function buildScheduledServiceLookup(statusRows = []) {
+  const lookup = new Set();
+  for (const row of statusRows || []) {
+    if (String(row?.tipo_personal || row?.tipoPersonal || '').trim() !== 'empleado') continue;
+    if (row?.servicio_programado !== true && row?.servicioProgramado !== true) continue;
+    for (const key of statusLookupKeys(row)) lookup.add(key);
+  }
+  return lookup;
+}
+
+function attendanceHasScheduledService(row = {}, lookup = new Set()) {
+  return statusLookupKeys(row).some((key) => lookup.has(key));
+}
+
+function statusLookupKeys(row = {}) {
+  const fecha = String(row?.fecha || '').trim();
+  const employeeId = String(row?.employee_id || row?.employeeId || row?.empleado_id || row?.empleadoId || '').trim();
+  const documento = String(row?.documento || '').trim();
+  return [
+    fecha && employeeId ? `${fecha}_id:${employeeId}` : '',
+    fecha && documento ? `${fecha}_doc:${documento}` : ''
+  ].filter(Boolean);
+}
+
 async function cleanupNonProgrammedClosedOperationalAbsenteeism(day) {
   const refreshed = await refreshEmployeeDailyStatusSnapshot(day);
   if (refreshed === null) return 0;
 
   const { data: statusRows, error } = await supabaseAdmin
     .from('employee_daily_status')
-    .select('source_replacement_id, source_absenteeism_id, source_attendance_id, source_incapacity_id, tipo_personal, servicio_programado')
+    .select('employee_id, documento, source_replacement_id, source_absenteeism_id, source_attendance_id, source_incapacity_id, tipo_personal, servicio_programado')
     .eq('fecha', day)
     .eq('tipo_personal', 'empleado')
     .eq('servicio_programado', false);
   if (error) throw error;
 
-  const candidateRows = (statusRows || []).filter((row) => !row?.source_attendance_id && !row?.source_incapacity_id && (row?.source_replacement_id || row?.source_absenteeism_id));
+  const candidateRows = (statusRows || []).filter((row) => row?.source_replacement_id || row?.source_absenteeism_id);
   if (!candidateRows.length) return 0;
 
   const chunk = (items, size = 200) => {
@@ -3417,8 +3648,9 @@ async function cleanupNonProgrammedClosedOperationalAbsenteeism(day) {
     return output;
   };
 
-  const replacementIds = [...new Set(candidateRows.map((row) => row?.source_replacement_id).filter(Boolean))];
-  const absenteeismIds = [...new Set(candidateRows.map((row) => row?.source_absenteeism_id).filter(Boolean))];
+  const deterministicIds = candidateRows.map((row) => buildDailyRecordId(day, row?.documento, row?.employee_id)).filter(Boolean);
+  const replacementIds = [...new Set([...candidateRows.map((row) => row?.source_replacement_id), ...deterministicIds].filter(Boolean))];
+  const absenteeismIds = [...new Set([...candidateRows.map((row) => row?.source_absenteeism_id), ...deterministicIds].filter(Boolean))];
 
   const cronReplacementIds = [];
   for (const batch of chunk(replacementIds)) {
@@ -3791,17 +4023,27 @@ async function getSession(phone) {
 
 async function storeSession(phone, patch = {}) {
   const existing = await getSession(phone);
+  const phoneNumber = patch.phone_number === undefined
+    ? getSessionPhone(existing) || normalizePhone(phone) || null
+    : normalizePhone(patch.phone_number) || null;
   const payload = {
     id: phone,
-    phone_number: phone,
+    phone_number: phoneNumber,
     employee_id: patch.employee_id === undefined ? existing.employee_id || null : patch.employee_id,
     documento: patch.documento === undefined ? existing.documento || null : patch.documento,
     session_state: patch.session_state || SESSION.IDLE,
-    session_data: patch.session_data || {},
+    session_data: {
+      ...(patch.session_data || {}),
+      ...(phoneNumber ? { sharedPhone: phoneNumber } : {})
+    },
     last_message_at: new Date().toISOString()
   };
   const { error } = await supabaseAdmin.from('whatsapp_sessions').upsert(payload, { onConflict: 'id' });
   if (error) throw error;
+}
+
+function getSessionPhone(session = {}) {
+  return normalizePhone(session?.phone_number || session?.session_data?.sharedPhone || session?.session_data?.employee?.telefono);
 }
 
 async function resetSession(phone, session, extraData) {
@@ -3848,11 +4090,46 @@ function parseInboundAction(message) {
   const interactive = message?.interactive || {};
   const buttonReply = interactive?.button_reply || null;
   const listReply = interactive?.list_reply || null;
+  const contact = extractMessageContact(message);
   return {
     id: String(buttonReply?.id || listReply?.id || '').trim(),
     title: String(buttonReply?.title || listReply?.title || '').trim(),
     value: String(buttonReply?.title || listReply?.title || textValue || '').trim(),
-    location: extractMessageLocation(message)
+    location: extractMessageLocation(message),
+    contactPhone: contact?.phone || null,
+    contactWaId: contact?.waId || null,
+    contactOrigin: contact?.origin || null
+  };
+}
+
+function getWhatsAppRecipient(message = {}) {
+  return String(
+    message?.from ||
+    message?.from_user_id ||
+    message?.user_id ||
+    message?.recipient_id ||
+    message?.sender_contact?.wa_id ||
+    message?.sender_contact?.user_id ||
+    message?.customer?.id ||
+    message?.contacts?.[0]?.wa_id ||
+    message?.contacts?.[0]?.user_id ||
+    message?.contacts?.[0]?.phones?.[0]?.wa_id ||
+    ''
+  ).trim();
+}
+
+function extractMessageContact(payload) {
+  const contacts = Array.isArray(payload?.contacts) ? payload.contacts : [];
+  const contact = contacts[0] || null;
+  if (!contact) return null;
+  const phones = Array.isArray(contact?.phones) ? contact.phones : [];
+  const phoneEntry = phones.find((item) => normalizePhone(item?.wa_id || item?.phone)) || phones[0] || {};
+  const phone = normalizePhone(phoneEntry?.wa_id || phoneEntry?.phone || contact?.wa_id);
+  if (!phone) return null;
+  return {
+    phone,
+    waId: normalizePhone(phoneEntry?.wa_id || contact?.wa_id),
+    origin: String(contact?.origin || phoneEntry?.origin || '').trim()
   };
 }
 
@@ -3984,6 +4261,23 @@ async function sendText(to, body) {
   await sendWhatsAppMessage(to, { type: 'text', text: { body } });
 }
 
+async function sendContactRequest(to) {
+  const body = 'Para continuar con tu registro necesitamos que compartas tu número de WhatsApp.';
+  try {
+    await sendWhatsAppMessage(to, {
+      type: 'interactive',
+      interactive: {
+        type: 'request_contact_info',
+        body: { text: body },
+        action: { name: 'request_contact_info' }
+      }
+    });
+  } catch (error) {
+    console.error('No se pudo enviar solicitud nativa de contacto, enviando texto:', error);
+    await sendText(to, `${body}\n\nUsa la opción de WhatsApp para compartir tu contacto.`);
+  }
+}
+
 async function sendButtons(to, body, buttons) {
   await sendWhatsAppMessage(to, {
     type: 'interactive',
@@ -4041,6 +4335,13 @@ async function sendWhatsAppMessage(to, payload) {
   if (!config.whatsappAccessToken || !config.whatsappPhoneNumberId) {
     throw new Error('missing_whatsapp_credentials_or_recipient');
   }
+  const normalizedRecipientPhone = normalizePhone(to);
+  const recipientPayload = normalizedRecipientPhone
+    ? { to: normalizedRecipientPhone }
+    : { recipient: String(to || '').trim() };
+  if (!recipientPayload.to && !recipientPayload.recipient) {
+    throw new Error('missing_whatsapp_recipient');
+  }
 
   const response = await fetch(`https://graph.facebook.com/${config.whatsappGraphVersion}/${config.whatsappPhoneNumberId}/messages`, {
     method: 'POST',
@@ -4051,7 +4352,7 @@ async function sendWhatsAppMessage(to, payload) {
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
-      to,
+      ...recipientPayload,
       ...payload
     })
   });
